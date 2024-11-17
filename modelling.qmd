@@ -1,0 +1,223 @@
+---
+title: "Model Walkthrough: Modelling"
+author: "Ayush Batra"
+format: pdf
+editor: visual
+---
+
+This document walks through creating a simple college basketball prediction model in R. This is the modelling portion of the walkthrough, using the cleaned data to make predictions about win margins in games.
+
+# Load Packages and Data
+
+```{r}
+# Load packages
+
+if (!requireNamespace("pacman")) {
+  install.packages("pacman")
+}
+
+library(pacman)
+p_load(tidyverse, glmnet)
+```
+
+```{r}
+# Load in data
+games <- read_csv("games.csv")
+```
+
+## Quick data manipulation
+
+First we need to do one very quick data manipulation step. This is to convert our categorical variable (team location) into a factor. Categorical variables must be factors to be used in models in R. 
+
+```{r}
+# convert game location to a factor
+# necessary for use in modelling
+games <- games %>%
+  mutate(team_home_away = factor(team_home_away,
+                                 levels = c("away", "home")))
+```
+
+# Train Test Split
+
+When modelling, it is important to create two sets: a training set and a testing set. The training set is used to fit the model parameters, while the testing set is used for model evaluation. We cannot use the training set for model evaluation because the way training works is that the model calculates its parameters so that it optimizes performance on the training set. The testing set must be used for evaluation because it simulates data the model has not seen before. Usually, the training/testing split is aroudn 80-20 or 70-30. 
+
+```{r}
+# set seed for reproducibility
+set.seed(123)
+# choose training samples randomly
+n <- nrow(games)
+train_indices <- sample(1:n, size = round(0.75 * n), replace = F)
+
+# separate into train and test set
+train_df <- games[train_indices, ]
+test_df <- games[-train_indices, ]
+```
+
+# Multiple Linear Regression
+
+## Fitting
+
+A simple model for estimating margin of victory is to use multiple linear regression. As an example, we can use the advanced features that we engineered, along with home court advantage, to calculate the expected margin of victory. 
+
+In base R, we fit a multiple linear regression using the `lm` command, specifying the formula using R's formula notation. 
+
+```{r}
+# Fit multiple linear regression
+# Formula means fit mov as a function of ...
+linear_fit <- lm(formula = mov ~ eFGP + TOVP + ORBP + FTR +
+                   eFGP.opp + TOVP.opp + ORBP.opp + FTR.opp + team_home_away,
+                 data = train_df)
+
+# Get summary of coefficients
+summary(linear_fit)
+```
+
+[Aside: interaction terms can be used by specifying `var1*var2` in the formula]
+
+## Evaluation
+
+To see how well this model performs, we assess its error on the train and test sets. In this example, I use root mean squared error. 
+
+One important thing to look out for is how well the model generalizes. A model generalizes well to new data if the error rates between the train and test sets are comparable (the train error will almost always be lower than the test error; we just don't want it to be a lot lower). If the test error is a lot higher than the train error, the model is likely overfitting on the training data, making its predictions on unseen data undependable. 
+
+```{r}
+
+# function to calculate root mean squared error between two vectors
+rmse <- function(x, y) {
+  return(sqrt(mean((x-y)^2)))
+}
+
+# get predictions on train and test set
+# use a model to get predictions on new data using `predict`
+mlr_train_preds <- predict(linear_fit, train_df)
+mlr_test_preds <- predict(linear_fit, test_df)
+
+# calculate RMSE on train and test set
+rmse(mlr_train_preds, train_df$mov)
+rmse(mlr_test_preds, test_df$mov)
+
+
+# inspect distributions of residuals
+# `hist` plots a histogram in base R
+hist(resid(linear_fit), main = "Distribution of Residuals - Training",
+     xlab = "Residual")
+hist(test_df$mov - mlr_test_preds,
+     main = "Distribution of Residuals - Testing", xlab = "Residual")
+
+```
+
+Here, we see that the train and test data have comparable errors, so the model is likely generalizing well. 
+
+# Regularization: LASSO Regression
+
+Another type of model (a perhaps more versatile one) is a LASSO regression. 
+
+LASSO regression uses a regularization term ($\lambda$), which shrinks the coefficients towards zero. This happens because LASSO regression calculates the parameters ($\beta$ values) by minimizing the following equation: 
+
+$$\sum_{i=1}^N \left(y_i - \sum_{j=1}^p x_{ij} \beta_j\right)^2 + \lambda\sum_{j=1}^p |\beta_j|$$
+
+The second term in this equations makes it so that smaller $\beta$ values are favored. The $\lambda$ is a hyperparameter that determines the strength of the regularizaiton. We will optimize this using cross validation (seen later). 
+
+
+## Data Manipulation
+
+For LASSO regression, there is some more data manipulation. 
+
+The `glmnet` package is one package that is used for Lasso regression in R, and that package requires data to be in the form of vectors and matrices (as opposed to data frames). 
+
+Additionally, for Lasso regression we need to normalize each variable so the $\lambda$ parameter penalizes each parameter equally. This allows the Lasso regularization penalty to be applied to all variables equally. 
+
+```{r}
+# Gather predictor columns
+a <- which(colnames(games) == "eFGP")
+b <- which(colnames(games) == "past_turnovers")
+pred_cols <- colnames(games)[a:b]
+pred_cols <- c(pred_cols, paste0(pred_cols, ".opp"))
+
+# transform data into a matrix and a vector
+X <- as.matrix(games[,pred_cols])
+y <- games %>% pull(mov)
+
+# split into train and test
+X_train <- X[train_indices,]
+y_train <- y[train_indices]
+X_test <- X[-train_indices,]
+y_test <- y[-train_indices]
+
+# normalize
+X_train <- apply(X_train, 2, function(x) (x - mean(x)) / sd(x))
+X_test <- apply(X_test, 2, function(x) (x - mean(x)) / sd(x))
+```
+
+## Naive Multiple Linear Regression
+
+First, let's see what happens when we just try to run a multiple linear regression using all of the predictors. 
+
+```{r}
+
+# Fit multiple linear regression using all variables
+linear_fit_big <- lm(formula = y_train ~ X_train)
+summary(linear_fit_big)
+
+# Function to calculate error
+calculate_error <- function(model, X, y) {
+  return(rmse(predict(model, data.frame(X)), y))
+}
+
+# See error on train and test sets
+calculate_error(linear_fit_big, X_train, y_train)
+calculate_error(linear_fit_big, X_test, y_test)
+
+```
+
+When we look at the errors here, we see a large discrepancy between the train and test errors. This is a sign that the model is not generalizing well. The reason for this is likely due to the vast number of predictor variables. 
+
+## Cross Validation and Lasso fitting
+
+To fit the Lasso regression model, we first use cross validation to determine the optimal value for the $\lambda$ hyperparameter. Cross validation works by testing several values for $\lambda$, and for each candidate value, training on $k-1$ partitions (folds) of data while testing on the one partition not used in training. The estimated error for a candidate $\lambda$ is calculated as its average testing performance across all the partitions/folds. 
+
+```{r}
+
+# Cross-validated LASSO regression
+# here, k = 5 partitions/folds
+lasso_cv <- cv.glmnet(X_train, y_train, nfolds = 5)
+
+# Best lambda
+best_lambda_lasso <- lasso_cv$lambda.min
+cat("Optimal Lambda for LASSO:", best_lambda_lasso, "\n")
+
+plot(lasso_cv)
+
+# Coefficients for the best LASSO model
+coef(lasso_cv, s = "lambda.min")
+# convert to a vector
+coefs <- setNames(as.vector(coef(lasso_cv, s = "lambda.min")),
+                  rownames(coef(lasso_cv, s = "lambda.min")))
+# sort the coefficients
+round(sort(coefs),3)
+
+
+# Predictions using the best LASSO model
+# newx must be a matrix
+lasso_preds_train <- predict(lasso_cv, s = "lambda.min", newx = X_train)
+lasso_preds_test <- predict(lasso_cv, s = "lambda.min", newx = X_test)
+
+# Calculate errors
+rmse(y_train, lasso_preds_train)
+rmse(y_test, lasso_preds_test)
+
+```
+
+After using a Lasso regularization term, we see that the model generalizes much better, as the difference between the train and test set has decreased by a significant amount. 
+
+In general, regularization is a great tool to create more interpretable models and to decrease overfitting. Regularization parameters can almost always be tuned using something like cross validation. 
+
+# Other Models
+
+Other models include tree-based models (decision trees, random forests, xgBoost), Bayesian models, and sports specific models (ELO, player based, possession based, etc.). We cannot cover them all here, but you will almost always need to split data into training and testing sets, use cross validation to optimize hyperparameters, and compare train/test performance to ensure generalization. 
+
+
+
+
+
+

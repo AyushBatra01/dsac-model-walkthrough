@@ -1,0 +1,210 @@
+---
+title: "Model Walkthrough: Data Cleaning"
+author: "Ayush Batra"
+format: pdf
+editor: visual
+---
+
+This document walks through creating a simple college basketball prediction model in R. This is the data cleaning portion of the walkthrough, loading in raw game level data and transforming it into a format that it useful for modelling.
+
+# Packages
+
+First, we will load in packages. The `pacman` package allows for simple package loading, the `tidyverse` package will help with data cleaning, and `hoopR` is a [very useful package](https://hoopr.sportsdataverse.org/) for retrieving all kinds of basketball data.
+
+```{r}
+if (!requireNamespace("pacman")) {
+  install.packages("pacman")
+}
+
+library(pacman)
+p_load(tidyverse, hoopR)
+```
+
+# Load Raw Data
+
+We can use the `load_mbb_team_box` function from `hoopR` to access box score stats for each team in each game over the specified set of seasons. Here, we will look at games from the 2014-15 to 2023-24 college basketball seasons, inclusive.
+
+```{r}
+# Load raw data (this may take a few seconds)
+raw_games <- load_mbb_team_box(seasons = 2015:2024)
+```
+
+# Gathering Stats
+
+To begin, we may want to choose a subset of variables. Here, only game and team identifiers are kept, along with a variable denoting home court advantage and all box score stats. Additionally, we join the data with itself to get both the team's offensive and defensive stats for each game.
+
+```{r}
+# Select relevant variables
+games <- raw_games %>%
+  select(game_id, season, game_date, team_id, team_location,
+         team_home_away, team_score, assists:turnovers)
+
+# Note: `assists:turnovers` selects all columns between these two, inclusive
+
+
+# Join to get opponent stats
+games <- games %>%
+  # join data with itself
+  # use suffix to differentiate between offensive and defensive stats
+  inner_join(games, by = c("game_id", "season", "game_date"),
+             suffix = c("", ".opp")) %>%
+  # remove matches from one team with itself (this is redundant data)
+  filter(team_id != team_id.opp)
+
+# Note: expect to get a warning message here about unexpected many-to-many
+# matches. This is not an issue because we remove the unexpected matches in the
+# filtering step. 
+```
+
+# Feature Engineering
+
+## Cumulative Box Score Averages
+
+In order to make a useful model, we must have features that tell us about the teams that are playing in each game. In this example, our features will be the team's per game average box score stats (and a few advanced stats) up until the given game.
+
+In order to create these statistics correctly, we make use of vectorized cumulative sum functions as well as functions that allow us to avoid doing a lot of manual data manipulation.
+
+```{r}
+# Arrange games by date in ascending order
+games <- games %>%
+  arrange(game_date)
+
+
+# Add season game number for team/season combo
+# This lets us keep track of how many games the team has played until then
+games <- games %>%
+  group_by(season, team_id) %>%
+  # this will add a column that is 1,2,3,... for each team/season group
+  # since the data is arranged by date, it will be the correct game number
+  mutate(game_num = 1:n()) %>%
+  ungroup()
+
+
+# Gather the box score stats to average
+a <- which(colnames(games) == "team_score")  # this is the first box score stat
+b <- which(colnames(games) == "turnovers")   # this is the last box score stat
+cols_to_avg <- colnames(games)[a:b]        # take all column between these two
+# add in defensive stats
+cols_to_avg <- c(cols_to_avg, paste0(cols_to_avg,".opp")) 
+```
+
+To get the average box score stats for a given team up until a certain game, without including any information that would have been known only after the game was played, we can use a cumulative sum. The cumulative sum will add a column taking the sum of each box score stat for the team in the given game and all games before it.
+
+This cumulative sum includes the stats of the current game, which is not something that would be known beforehand (this is an example of [data leakage](https://en.wikipedia.org/wiki/Leakage_(machine_learning)). To remedy this, we subtract the stats from the current game.
+
+Lastly, we divide by the number of games played before the given game to get the cumulative average of each box score stat for all games strictly prior to the given game.
+
+```{r}
+# Step 1: Take the cumulative sum
+games <- games %>%
+  group_by(season, team_id) %>%
+  # take cumulative sum across all of box score stats using `across`
+  # name these cumulative sum columns "past_{stat name}"
+  # Ex: turnovers -> "past_turnovers"
+  mutate(across(all_of(cols_to_avg), cumsum, .names = "past_{.col}")) %>%
+  ungroup()
+
+
+# Step 2: Calculate the average from the sum
+# loop over all box score stats
+for (col in cols_to_avg) {
+  # get the name of the column to manipulate
+  pcol <- paste0("past_", col)
+  # Subtract current game stats from cumulative sum
+  games[[pcol]] <- games[[pcol]] - games[[col]]
+  # Calculate average
+  # Note: df[[col]] and df$col are both valid ways of referencing a column
+  #       the first one is useful for referencing columns using strings
+  games[[pcol]] <- games[[pcol]] / (games$game_num - 1)
+}
+
+
+# Show example of what data looks like
+games %>%
+  filter(season == 2024, team_location == "Duke") %>%
+  mutate(n_past_games = game_num - 1,
+         past_total_turnovers = past_turnovers * n_past_games) %>%
+  select(game_num, game_date, team_location.opp, turnovers,
+         past_total_turnovers, past_turnovers, n_past_games) %>%
+  head(10)
+```
+
+## Advanced Stats
+
+We can also calculate some advanced stats using these box score statistics. Some examples include the "four factors" of basketball: effective field goal percentage (`eFGP`), turnover rate (`TOVP`), offensive rebounding percentage (`ORBP`), and free throw rate (`FTR`). To read more about these stats, see this page on [Basketball Reference](https://www.basketball-reference.com/about/factors.html).
+
+```{r}
+
+# Calculate advanced stats, using formulas from Basketball Reference
+games <- games %>%
+  mutate(eFGP = 100 * (past_field_goals_made + 
+                   0.5 * past_three_point_field_goals_made) /
+           past_field_goals_attempted,
+         TOVP = 100 * past_turnovers / (past_field_goals_attempted + 
+                                    past_turnovers + 
+                                    0.44 * past_free_throws_attempted),
+         ORBP = 100 * past_offensive_rebounds / (past_offensive_rebounds + 
+                                             past_defensive_rebounds.opp),
+         FTR = past_free_throws_made / past_field_goals_attempted)
+
+
+# Show preview of advanced stats
+games %>%
+  filter(season == 2024, team_location == "Duke") %>%
+  select(game_date, team_location.opp, eFGP:FTR)
+```
+
+# Final Cleanup
+
+There are only a few more steps until this data is ready for modeling.
+
+One thing we may want to do is to further filter our data. As can be seen above, this approach does not allow for predictions on the first game of the season, because there are no previous games to get data from before the first game. Along similar lines, games from early in the season may suffer from noisy numbers due to a small sample size of games played. Here, I filter the data to only include stats from games after the team has played 15 games. This means each observation will have stats with a solid sample size and hopefully aren't too noisy. This is also about the number of games that are played by teams by the beginning of January (the TSA submissions are due in Early January).
+
+```{r}
+# Include only games that have enough data
+games <- games %>%
+  filter(game_num > 15)
+```
+
+Lastly, we should filter the data to remove any columns we do not plan on using at all. We can just keep identifier columns, information about margin of victory (since that is what we will be modelling), and the stats we calculated.
+
+```{r}
+# Get which columns should be kept
+# This basically says to keep any columns that have the form "past_{...}",
+# but do not end in ".opp"
+past_cols <- colnames(games)[(grepl("^past_", colnames(games))) &
+                               !grepl("\\.opp$", colnames(games))]
+
+# select subset of columns
+filt <- games %>%
+  select(game_id : team_score, eFGP:FTR, all_of(past_cols))
+```
+
+We also want to take into account both teams' cumulative average stats when making predictions. To do this, we join the data with itself. We also only want to keep one copy of each game, since keeping multiple copies is duplicating data. One way to do this is to keep the team with the larger ID (there are many ways to do this; what I chose is just one of them).
+
+```{r}
+# Get team and opponent cumulative stats
+filt <- filt %>%
+  # join with self to get opponent stats
+  inner_join(filt, by = c("game_id", "season", "game_date"),
+             suffix = c("", ".opp")) %>%
+  # only keep one team per game
+  filter(team_id > team_id.opp) %>%
+  # calculate margin of victory
+  mutate(mov = team_score - team_score.opp) 
+
+# Again, expect to see a warning about the join for this piece of code, 
+# because of the way we filter after joining
+
+
+# This line should print out 28412
+nrow(filt)
+```
+
+# Save Result
+
+We save the final dataframe so we can use it for modelling in the future, without having to repeat the data cleaning process.
+
+```{r}
+write_csv(filt, "games.csv")
+```
